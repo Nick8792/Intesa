@@ -180,23 +180,34 @@ function subScores(sol, input, cfg, refs) {
   let vpl = 50;
   if (refs.vplMax > refs.vplMin) vpl = (100 * (m.vplRaw - refs.vplMin)) / (refs.vplMax - refs.vplMin);
 
-  return { uniformity, liquidita, strumenti, minBonifico, comfort, vpl };
+  // Quota di bonifico (acconto + credito) sul prezzo: base della commissione
+  // del consulente. Più bonifico = più "incassato" per il consulente.
+  const bonifico = input.prezzo > 0 ? clamp((100 * (m.bonificoIniziale + m.bonificoCredito)) / input.prezzo, 0, 100) : 0;
+
+  return { uniformity, liquidita, strumenti, minBonifico, comfort, vpl, bonifico };
 }
 
 // ---- Pesi per priorità (configurabili da Admin) ---------------------------
+// NB: 'vpl' e 'liquidita' rivisti (vedi rinomina UI: "Massimizza VPL" e
+// "Massimizza Incassato"). Le altre tre priorità restano INVARIATE.
 const DEFAULT_WEIGHTS = {
-  vpl:          { vpl: 0.55, liquidita: 0.20, uniformity: 0.10, comfort: 0.08, strumenti: 0.05, minBonifico: 0.02 },
-  liquidita:    { liquidita: 0.50, strumenti: 0.22, vpl: 0.12, uniformity: 0.08, comfort: 0.05, minBonifico: 0.03 },
-  rata:         { uniformity: 0.50, comfort: 0.25, liquidita: 0.12, vpl: 0.08, strumenti: 0.03, minBonifico: 0.02 },
-  minbonifico:  { minBonifico: 0.45, liquidita: 0.22, strumenti: 0.15, uniformity: 0.10, vpl: 0.05, comfort: 0.03 },
-  equilibrata:  { uniformity: 0.20, liquidita: 0.20, vpl: 0.20, comfort: 0.20, strumenti: 0.12, minBonifico: 0.08 },
+  // "Massimizza VPL": massimo incasso immediato dell'azienda (BNPL anticipa),
+  // riduce il credito bonifico, valorizza la VPL. Scalapay-first via tie-break.
+  vpl:          { liquidita: 0.42, vpl: 0.30, strumenti: 0.18, comfort: 0.06, uniformity: 0.04, minBonifico: 0.00, bonifico: 0.00 },
+  // "Massimizza Incassato": privilegia il bonifico (commissione consulente)
+  // cercando il miglior compromesso con sostenibilità (comfort/uniformità).
+  liquidita:    { bonifico: 0.45, comfort: 0.22, uniformity: 0.18, vpl: 0.08, liquidita: 0.05, strumenti: 0.02, minBonifico: 0.00 },
+  rata:         { uniformity: 0.50, comfort: 0.25, liquidita: 0.12, vpl: 0.08, strumenti: 0.03, minBonifico: 0.02, bonifico: 0.00 },
+  minbonifico:  { minBonifico: 0.45, liquidita: 0.22, strumenti: 0.15, uniformity: 0.10, vpl: 0.05, comfort: 0.03, bonifico: 0.00 },
+  equilibrata:  { uniformity: 0.20, liquidita: 0.20, vpl: 0.20, comfort: 0.20, strumenti: 0.12, minBonifico: 0.08, bonifico: 0.00 },
 };
 
 function totalScore(ss, priorita, weights) {
   const w = weights[priorita] || weights.equilibrata;
   return (
-    w.vpl * ss.vpl + w.liquidita * ss.liquidita + w.uniformity * ss.uniformity +
-    w.comfort * ss.comfort + w.strumenti * ss.strumenti + w.minBonifico * ss.minBonifico
+    (w.vpl || 0) * ss.vpl + (w.liquidita || 0) * ss.liquidita + (w.uniformity || 0) * ss.uniformity +
+    (w.comfort || 0) * ss.comfort + (w.strumenti || 0) * ss.strumenti + (w.minBonifico || 0) * ss.minBonifico +
+    (w.bonifico || 0) * ss.bonifico
   );
 }
 
@@ -297,19 +308,53 @@ function rankCandidates(candidates, input, cfg) {
   }
   const refs = { vplMin, vplMax };
   const weights = cfg.weights || DEFAULT_WEIGHTS;
+  // Ordine di preferenza provider (politica commerciale): provider attivi
+  // nell'ordine configurato in Admin. Usato SOLO come tie-break.
+  const order = (cfg.providers || []).filter((p) => p.attivo).map((p) => p.id);
 
-  let best = null, bestScore = -1, bestSub = null;
+  // Passata 1: miglior candidato per punteggio (a parità, uniformità maggiore).
+  // È la STESSA logica di selezione precedente: determina il PIANO ottimo, che
+  // resta quindi invariato. Se Klarna consente un punteggio più alto o l'unico
+  // piano ammissibile, viene scelto qui.
+  let best = null;
   for (const sol of candidates) {
-    const ss = subScores(sol, input, cfg, { ...refs, vplRaw: sol.metrics.vplRaw });
-    const sc = totalScore(ss, input.priorita, weights);
-    if (sc > bestScore + 1e-9 || (Math.abs(sc - bestScore) < 1e-9 && best && ss.uniformity > bestSub.uniformity)) {
-      best = sol; bestScore = sc; bestSub = ss;
-    }
+    sol._ss = subScores(sol, input, cfg, { ...refs, vplRaw: sol.metrics.vplRaw });
+    sol._sc = totalScore(sol._ss, input.priorita, weights);
+    if (!best || sol._sc > best._sc + 1e-9 ||
+        (Math.abs(sol._sc - best._sc) < 1e-9 && sol._ss.uniformity > best._ss.uniformity)) best = sol;
   }
-  best.score = Math.round(bestScore);
-  best.sub = bestSub;
+  // Passata 2: PREFERENZA PROVIDER come tie-break, applicata SOLO tra soluzioni
+  // realmente equivalenti — stesso punteggio E stesso piano mensile. Tra queste
+  // sceglie chi usa di più il provider preferito (Scalapay per default). Non
+  // altera mai il piano: cambia solo l'attribuzione tra provider.
+  for (const sol of candidates) {
+    if (sol === best) continue;
+    if (Math.abs(sol._sc - best._sc) < 1e-9 && sameSchedule(sol.totalM, best.totalM) &&
+        providerPrefCompare(sol, best, order) > 0) best = sol;
+  }
+  best.score = Math.round(best._sc);
+  best.sub = best._ss;
   best.candidateCount = candidates.length;
   return best;
+}
+
+function sameSchedule(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 1e-4) return false;
+  return true;
+}
+// Confronto lessicografico sugli importi provider secondo l'ordine di preferenza:
+// più importo nel provider più preferito = soluzione migliore.
+function providerPrefCompare(a, b, order) {
+  for (const id of order) {
+    const d = amountOf(a, id) - amountOf(b, id);
+    if (Math.abs(d) > 1e-6) return d;
+  }
+  return 0;
+}
+function amountOf(sol, id) {
+  const p = sol.alloc.prov.find((x) => x.id === id);
+  return p ? p.amount : 0;
 }
 
 // ---- Smart Rounding -------------------------------------------------------
@@ -336,6 +381,69 @@ function smartRound(best, input, cfg) {
   sol.score = best.score; sol.sub = best.sub; sol.candidateCount = best.candidateCount;
   sol.rounded = true;
   return sol;
+}
+
+/* ---- Commercial Rounding (rate del bonifico) -------------------------------
+   Post-elaborazione sulla soluzione finale: arrotonda le RATE DI CREDITO del
+   bonifico (mesi successivi a oggi) a cifre semplici da comunicare, mantenendo
+   INVARIATO il totale del bonifico. La differenza è compensata su una sola rata
+   (ultima o prima, configurabile). Non tocca l'acconto né gli altri strumenti.
+   È indipendente da ricerca e scoring: agisce solo sulla presentazione.        */
+function commercialMultiplo(cfg) {
+  const cr = cfg.commercialRounding || {};
+  switch (cr.modo) {
+    case 'euro': return 1;
+    case '5': return 5;
+    case '10': return 10;
+    case '50': return 50;
+    case 'personalizzato': return Math.max(0, cr.personalizzato || 0);
+    default: return 0; // 'nessuno'
+  }
+}
+function applyCommercialRounding(sol, cfg) {
+  if (!sol) return sol;
+  const mult = commercialMultiplo(cfg);
+  if (mult <= 0) return sol; // nessun arrotondamento
+  const strategia = (cfg.commercialRounding && cfg.commercialRounding.strategia) || 'ultima';
+
+  // Rate di credito SIGNIFICATIVE (esclude la "polvere" numerica del water-fill)
+  const idx = [];
+  for (let m = 1; m < sol.bonificoM.length; m++) if (sol.bonificoM[m] > 0.005) idx.push(m);
+  if (idx.length === 0) return sol;
+
+  const total = round2(sol.alloc.B);                          // credito da preservare
+  const compPos = strategia === 'prima' ? 0 : idx.length - 1; // rata che assorbe
+
+  const rounded = idx.map((m) => Math.round(sol.bonificoM[m] / mult) * mult);
+  let sumOthers = 0;
+  for (let i = 0; i < rounded.length; i++) if (i !== compPos) sumOthers += rounded[i];
+  const comp = round2(total - sumOthers);
+  if (comp < 0) return sol; // arrotondamento incoerente → mantieni i valori esatti
+  rounded[compPos] = comp;
+
+  // azzera la polvere sui mesi credito non significativi, poi applica le rate
+  for (let m = 1; m < sol.bonificoM.length; m++) if (sol.bonificoM[m] <= 0.005) sol.bonificoM[m] = 0;
+  for (let i = 0; i < idx.length; i++) sol.bonificoM[idx[i]] = rounded[i];
+  recomputeSchedule(sol);
+  sol.commercialRounded = true;
+  return sol;
+}
+// Ricalcola piano mensile e metriche dipendenti dopo un ritocco del bonifico.
+function recomputeSchedule(sol) {
+  const H = sol.bonificoM.length;
+  for (let m = 0; m < H; m++) {
+    let v = sol.bonificoM[m];
+    for (const p of sol.alloc.prov) v += sol.provM[p.id][m];
+    sol.totalM[m] = round2(v);
+  }
+  const nonZero = sol.totalM.filter((v) => v > 1e-6);
+  sol.metrics.peak = round2(Math.max(...sol.totalM));
+  sol.metrics.pagatoOggi = round2(sol.totalM[0]);
+  sol.metrics.nRateBonifico = sol.bonificoM.filter((v) => v > 1e-6).length;
+  sol.metrics.nRateCredito = sol.bonificoM.slice(1).filter((v) => v > 1e-6).length;
+  sol.metrics.nRateEffettive = nonZero.length;
+  sol.metrics.uniformitaStd = stdev(nonZero);
+  sol.metrics.uniformitaMean = mean(nonZero);
 }
 
 // ---- helper ---------------------------------------------------------------
@@ -371,6 +479,14 @@ const DEFAULT_CONFIG = {
   smartRoundingOn: true,
   smartRoundingMultiplo: 50,    // 50 / 100 / 250
   smartRoundingTolleranza: 100, // scostamento € max accettato per arrotondare
+  // Commercial Rounding: arrotonda le RATE DEL BONIFICO a cifre "dicibili" al
+  // cliente, mantenendo invariato il totale del bonifico. Logica separata dallo
+  // Smart Rounding (che agisce sui TOTALI degli strumenti).
+  commercialRounding: {
+    modo: 'euro',            // 'nessuno' | 'euro' | '5' | '10' | '50' | 'personalizzato'
+    personalizzato: 25,      // usato solo se modo === 'personalizzato'
+    strategia: 'ultima',     // dove va la differenza: 'ultima' | 'prima' rata
+  },
   // VPL = Valore per Lead: formula lineare configurabile (nessuna formula finanziaria)
   vpl: { base: 0, cPrezzo: 0.3, cIncasso: 0.7, cLiquidita: 2, cBNPL: 0.2, cCredito: -0.5 },
   // Profili Provider: il motore legge SEMPRE queste regole, non conosce i nomi.
@@ -437,17 +553,17 @@ let CONFIG = loadConfig();
    STATO + UTILITÀ DOM
    ========================================================================== */
 const PRIORITA = [
-  { key: 'equilibrata', label: 'Equilibrata',  sub: 'Bilanciata' },
-  { key: 'liquidita',   label: 'Liquidità',    sub: 'Incasso oggi' },
-  { key: 'rata',        label: 'Rata costante', sub: 'Mensilità uniformi' },
-  { key: 'minbonifico', label: 'Min. bonifico', sub: 'Acconto minimo' },
-  { key: 'vpl',         label: 'VPL',           sub: 'Valore per Lead' },
+  { key: 'vpl',         label: 'Massimizza VPL',       sub: 'Incasso immediato azienda',      desc: "Privilegia l'incasso immediato dell'azienda." },
+  { key: 'liquidita',   label: 'Massimizza Incassato', sub: 'Commissione consulente',         desc: 'Privilegia il bonifico per aumentare la commissione del consulente.' },
+  { key: 'equilibrata', label: 'Equilibrata',          sub: 'Bilanciata',                     desc: 'Bilancia incasso, sostenibilità e VPL.' },
+  { key: 'rata',        label: 'Rata costante',        sub: 'Mensilità uniformi',             desc: 'Rende le rate mensili il più uniformi possibile.' },
+  { key: 'minbonifico', label: 'Min. bonifico',        sub: 'Acconto minimo',                 desc: 'Riduce al minimo l\'acconto in bonifico oggi.' },
 ];
 const PREZZI = [2000, 3000, 4000, 5000, 6000];
 const RATE = [2, 3, 4, 5, 6, 8, 10, 12];
 
 const state = {
-  input: { prezzo: 3000, nRate: 6, dispOggi: 0, maxMensile: 0, priorita: 'equilibrata' },
+  input: { prezzo: 3000, nRate: 6, dispOggi: 0, maxMensile: 0, priorita: 'vpl' },
   locks: {},        // chiavi piatte: 'A', 'amt_<id>', 'rate_<id>' — Manuale Assistita
   manual: false,
   sol: null,
@@ -487,6 +603,7 @@ function buildInputs() {
   const pp = $('#pillsPriorita'); pp.innerHTML = '';
   PRIORITA.forEach((p) => {
     const b = el('button', 'pill', `${p.label}<small>${p.sub}</small>`); b.type = 'button'; b.dataset.key = p.key;
+    if (p.desc) b.title = p.desc;
     b.onclick = () => { state.input.priorita = p.key; syncPills(); compute(); };
     pp.appendChild(b);
   });
@@ -528,11 +645,13 @@ function compute() {
   const focus = captureFocus();
   const mode = state.manual ? 'manual' : 'auto';
   if (state.manual) {
-    const sol = optimize(inp, CONFIG, buildLocks());
+    let sol = optimize(inp, CONFIG, buildLocks());
+    if (sol) sol = applyCommercialRounding(sol, CONFIG);
     state.sol = sol; renderResult(sol, 'manual');
   } else {
     let best = optimize(inp, CONFIG);
     if (best) best = smartRound(best, inp, CONFIG);
+    if (best) best = applyCommercialRounding(best, CONFIG);
     state.sol = best; renderResult(best, 'auto');
   }
   restoreFocus(focus);
@@ -643,6 +762,11 @@ function renderInstruments(sol, mode) {
     bd = parts.join(' · ');
   }
   cb.appendChild(el('div', 'inst-detail', bd));
+  if (a.B >= 1) {
+    const rate = [];
+    for (let m = 1; m < sol.bonificoM.length; m++) if (sol.bonificoM[m] > 0.005) rate.push(eur(sol.bonificoM[m]));
+    if (rate.length) cb.appendChild(el('div', 'inst-rate-summary', 'Rate: ' + rate.join(' • ')));
+  }
   if (mode === 'manual') { const row = el('div', 'inst-edit'); row.appendChild(miniField('A', a.A, '€', 'Acconto')); cb.appendChild(row); }
   wrap.appendChild(cb);
 
@@ -740,7 +864,7 @@ function renderPlan(sol) {
   }
   let ftds = `<td class="num" style="color:var(--bonifico)">${cell(sum(sol.bonificoM))}</td>`;
   ftds += provs.map((p) => `<td class="num" style="color:${colorVar(p._profile)}">${cell(sum(sol.provM[p.id]))}</td>`).join('');
-  const foot = `<tfoot class="plan-foot"><tr><td>Totale</td>${ftds}<td class="num total-col">${eur(sum(sol.totalM))}</td></tr></tfoot>`;
+  const foot = `<tfoot class="plan-foot"><tr><td>Totale</td>${ftds}<td class="num total-col">${eur(sol.metrics.venduto)}</td></tr></tfoot>`;
   t.innerHTML = head + '<tbody>' + rows + '</tbody>' + foot;
   wrap.appendChild(t);
   return wrap;
@@ -783,6 +907,11 @@ function buildProposalText(sol) {
     if (a.B >= 1) det.push(`credito ${eur(a.B)} su ${m.nRateCredito} mesi`);
     if (det.length) s += ` (${det.join(', ')})`;
     L.push(s);
+    if (a.B >= 1) {
+      const rate = [];
+      for (let i = 1; i < sol.bonificoM.length; i++) if (sol.bonificoM[i] > 0.005) rate.push(eur(sol.bonificoM[i]));
+      if (rate.length) L.push(`  rate bonifico: ${rate.join(' • ')}`);
+    }
   }
   for (const p of a.prov) {
     if (p.amount < 1) continue;
@@ -811,7 +940,7 @@ async function copyProposal() {
   }
 }
 function newDeal() {
-  state.input = { prezzo: 3000, nRate: 6, dispOggi: 0, maxMensile: 0, priorita: 'equilibrata' };
+  state.input = { prezzo: 3000, nRate: 6, dispOggi: 0, maxMensile: 0, priorita: 'vpl' };
   state.locks = {};
   if (state.manual) toggleManual(false);
   buildInputs(); compute();
@@ -854,7 +983,7 @@ function buildAdmin() {
   // --- PROFILI PROVIDER ---
   const gp = el('div', 'adm-group');
   gp.appendChild(el('h3', null, 'Profili Provider'));
-  gp.appendChild(el('p', 'hint', 'Il motore legge sempre queste regole: per aggiungere o cambiare un provider basta modificare un profilo, senza toccare l\'algoritmo.'));
+  gp.appendChild(el('p', 'hint', "Il motore legge sempre queste regole: per aggiungere o cambiare un provider basta modificare un profilo, senza toccare l'algoritmo. L'ordine (↑/↓) è anche l'ordine di preferenza: a parità di punteggio il motore sceglie il provider più in alto."));
   CONFIG.providers.forEach((p, i) => gp.appendChild(admProvider(p, i)));
   b.appendChild(gp);
 
@@ -863,6 +992,7 @@ function buildAdmin() {
     admSelect('Multiplo', 'smartRoundingMultiplo', [['50', 50], ['100', 100], ['250', 250]]),
     admNum('Scostamento max', 'smartRoundingTolleranza', '€', 'oltre questo, mantiene gli importi esatti'),
   ]));
+  b.appendChild(admCommercialRounding());
   b.appendChild(admGroup('Motore di calcolo', 'Granularità della ricerca.', [
     admNum('Passo di ricerca', 'searchStep', '€'),
   ]));
@@ -891,6 +1021,13 @@ function admProvider(p, i) {
   nameInp.onchange = () => { p.nome = nameInp.value || p.id; saveConfig(); compute(); };
   nameWrap.appendChild(nameInp);
   head.appendChild(nameWrap);
+  const ord = el('div', 'adm-prov-order');
+  const up = el('button', 'adm-ord-btn', '↑'); up.type = 'button'; up.title = 'Più preferito (tie-break)'; up.disabled = i === 0;
+  up.onclick = () => moveProvider(i, -1);
+  const dn = el('button', 'adm-ord-btn', '↓'); dn.type = 'button'; dn.title = 'Meno preferito (tie-break)'; dn.disabled = i === CONFIG.providers.length - 1;
+  dn.onclick = () => moveProvider(i, 1);
+  ord.appendChild(up); ord.appendChild(dn);
+  head.appendChild(ord);
   const sw = el('label', 'switch');
   const swi = document.createElement('input'); swi.type = 'checkbox'; swi.checked = !!p.attivo;
   swi.onchange = () => { p.attivo = swi.checked; saveConfig(); state.locks = {}; compute(); };
@@ -980,9 +1117,41 @@ function admSwitch(label, key) {
   sw.appendChild(inp); sw.appendChild(el('span', 'track')); row.appendChild(sw);
   return row;
 }
+function admCommercialRounding() {
+  const cr = CONFIG.commercialRounding;
+  const g = el('div', 'adm-group');
+  g.appendChild(el('h3', null, 'Commercial Rounding (rate bonifico)'));
+  g.appendChild(el('p', 'hint', "Arrotonda le rate del bonifico a cifre semplici da comunicare. Il totale del bonifico resta invariato: la differenza confluisce nella rata di compensazione."));
+  g.appendChild(crSelect('Arrotondamento', 'modo',
+    [['Nessuno', 'nessuno'], ["All'euro", 'euro'], ['Ai 5 €', '5'], ['Ai 10 €', '10'], ['Ai 50 €', '50'], ['Personalizzato', 'personalizzato']], true));
+  if (cr.modo === 'personalizzato') g.appendChild(crNum('Multiplo personalizzato', 'personalizzato', '€'));
+  g.appendChild(crSelect('Compensazione', 'strategia', [['Ultima rata', 'ultima'], ['Prima rata', 'prima']], false));
+  return g;
+}
+function crSelect(label, key, opts, refresh) {
+  const row = el('div', 'adm-row'); row.appendChild(el('label', null, label));
+  const sel = document.createElement('select');
+  opts.forEach(([t, v]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; if (CONFIG.commercialRounding[key] === v) o.selected = true; sel.appendChild(o); });
+  sel.onchange = () => { CONFIG.commercialRounding[key] = sel.value; saveConfig(); if (refresh) refreshAdmin(); compute(); };
+  row.appendChild(sel);
+  return row;
+}
+function crNum(label, key, unit) {
+  const row = el('div', 'adm-row'); row.appendChild(el('label', null, label));
+  const inp = document.createElement('input'); inp.type = 'number'; inp.value = CONFIG.commercialRounding[key]; inp.step = 'any';
+  inp.onchange = () => { CONFIG.commercialRounding[key] = parseFloat(inp.value) || 0; saveConfig(); compute(); };
+  const w = el('div'); w.style.display = 'flex'; w.style.alignItems = 'center'; w.style.gap = '6px';
+  w.appendChild(inp); if (unit) w.appendChild(el('span', 'mini-label', unit)); row.appendChild(w);
+  return row;
+}
 function refreshAdmin() { const open = $('#admin').classList.contains('is-open'); buildAdmin(); if (open) {/* resta aperto */} }
-
-function openAdmin() { $('#overlay').hidden = false; const d = $('#admin'); d.classList.add('is-open'); d.setAttribute('aria-hidden', 'false'); }
+// Sposta un provider nell'array (= ordine di preferenza + colonne piano).
+function moveProvider(i, dir) {
+  const a = CONFIG.providers, j = i + dir;
+  if (j < 0 || j >= a.length) return;
+  const t = a[i]; a[i] = a[j]; a[j] = t;
+  saveConfig(); refreshAdmin(); compute();
+}function openAdmin() { $('#overlay').hidden = false; const d = $('#admin'); d.classList.add('is-open'); d.setAttribute('aria-hidden', 'false'); }
 function closeAdmin() { $('#overlay').hidden = true; const d = $('#admin'); d.classList.remove('is-open'); d.setAttribute('aria-hidden', 'true'); }
 
 function exportConfig() {

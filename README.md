@@ -1,4 +1,4 @@
-# Intesa — Configuratore di pagamento sales
+# Intesa — Configuratore di pagamento
 
 **Il piano di pagamento ottimale tra Bonifico, Klarna e Scalapay, in tempo reale.**
 

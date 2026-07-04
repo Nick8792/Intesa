@@ -916,10 +916,11 @@ function renderVerdict(sol, mode) {
 }
 function explain(sol) {
   const m = sol.metrics, p = state.input.priorita, liq = Math.round(m.pctLiquidita), bits = [];
-  if (p === 'liquidita') bits.push(`incassi ${eur(m.incassatoOggi)} oggi (${liq}% del totale)`);
+  const bon = (m.bonificoIniziale || 0) + (m.bonificoCredito || 0);
+  if (p === 'liquidita') bits.push(`bonifico privilegiato (${eur(bon)}) per la commissione del consulente`);
   else if (p === 'rata') bits.push(`mensilità uniformi attorno a ${eur(m.uniformitaMean)}`);
   else if (p === 'minbonifico') bits.push(m.bonificoIniziale > 0 ? `acconto contenuto a ${eur(m.bonificoIniziale)}` : 'nessun acconto richiesto');
-  else if (p === 'vpl') bits.push(`massimo Valore per Lead, con ${liq}% incassato oggi`);
+  else if (p === 'vpl') bits.push(`massimo incasso immediato dell'azienda (${liq}% oggi)`);
   else bits.push(`equilibrio tra incasso (${liq}%) e sostenibilità della rata`);
   if (state.input.maxMensile > 0) bits.push(`picco rata mensile ${eur(m.peakMensile)}`);
   return 'Ottimizzata per ' + bits.join(' · ') + '.';
@@ -1178,7 +1179,7 @@ function buildAdmin() {
   const b = $('#adminBody'); b.innerHTML = '';
 
   b.appendChild(admGroup('Vincoli', 'Margine di tolleranza sui vincoli del cliente.', [
-    admNum('Tolleranza vincoli', 'tolleranza', '%', 'scostamento ammesso su disponibilità e rata max'),
+    admNum('Tolleranza vincoli', 'tolleranza', '%', 'scostamento ammesso su disponibilità e rata max', (v) => Math.max(0, v)),
   ]));
 
   // --- PROFILI PROVIDER ---
@@ -1191,15 +1192,15 @@ function buildAdmin() {
   b.appendChild(admGroup('Smart Rounding', 'Arrotonda gli importi a valori facili da comunicare.', [
     admSwitch('Attivo', 'smartRoundingOn'),
     admSelect('Multiplo', 'smartRoundingMultiplo', [['50', 50], ['100', 100], ['250', 250]]),
-    admNum('Scostamento max', 'smartRoundingTolleranza', '€', 'oltre questo, mantiene gli importi esatti'),
+    admNum('Scostamento max', 'smartRoundingTolleranza', '€', 'oltre questo, mantiene gli importi esatti', (v) => Math.max(0, v)),
   ]));
   b.appendChild(admCommercialRounding());
   b.appendChild(admGroup('Commissioni', 'Percentuali per stimare le commissioni del consulente. Solo informative: non influenzano il motore.', [
-    admNum('Bonifico', 'commissioneBonifico', '%'),
-    ...CONFIG.providers.map((p) => admProvNum(p, 'commissione', p.nome, '%')),
+    admNum('Bonifico', 'commissioneBonifico', '%', null, (v) => clamp(v, 0, 100)),
+    ...CONFIG.providers.map((p) => admProvNum(p, 'commissione', p.nome, '%', (v) => clamp(v, 0, 100))),
   ]));
   b.appendChild(admGroup('Motore di calcolo', 'Granularità della ricerca.', [
-    admNum('Passo di ricerca', 'searchStep', '€'),
+    admNum('Passo di ricerca', 'searchStep', '€', null, (v) => Math.max(10, Math.round(v))),
   ]));
   b.appendChild(admGroup('VPL — Valore per Lead',
     'Metrica commerciale interna, NON finanziaria. È una somma pesata: ogni coefficiente decide quanto pesa una grandezza della proposta.',
@@ -1241,9 +1242,9 @@ function admProvider(p, i) {
   card.appendChild(head);
 
   const body = el('div', 'adm-prov-body');
-  body.appendChild(admProvNum(p, 'maxRate', 'Rate massime', ''));
-  body.appendChild(admProvNum(p, 'minImporto', 'Importo minimo', '€'));
-  body.appendChild(admProvNum(p, 'maxImporto', 'Importo massimo', '€'));
+  body.appendChild(admProvNum(p, 'maxRate', 'Rate massime', '', (v) => Math.max(2, Math.round(v))));
+  body.appendChild(admProvNum(p, 'minImporto', 'Importo minimo', '€', (v, pr) => Math.min(Math.max(0, v), pr.maxImporto)));
+  body.appendChild(admProvNum(p, 'maxImporto', 'Importo massimo', '€', (v, pr) => Math.max(v, pr.minImporto || 0, 0)));
 
   // Sotto-sezione: Gestione Extra Prima Rata
   const ex = p.extra;
@@ -1251,7 +1252,7 @@ function admProvider(p, i) {
   exBox.appendChild(el('div', 'adm-extra-title', 'Gestione Extra Prima Rata'));
   exBox.appendChild(admExtraSelect(p, 'Modalità', 'modalita',
     [['Redistribuisci', 'redistribuisci'], ['Costo aggiuntivo', 'costo'], ['Manuale', 'manuale']]));
-  exBox.appendChild(admExtraNum(p, 'Valore extra', 'valore'));
+  exBox.appendChild(admExtraNum(p, 'Valore extra', 'valore', (v) => Math.max(0, v)));
   exBox.appendChild(admExtraSelect(p, 'Tipo valore', 'tipo', [['Importo €', 'importo'], ['Percentuale %', 'percentuale']]));
   if (ex.modalita === 'manuale')
     exBox.appendChild(admExtraSelect(p, 'Gestione', 'gestione', [['Redistribuisci', 'redistribuisci'], ['Costo aggiuntivo', 'costo']]));
@@ -1260,18 +1261,18 @@ function admProvider(p, i) {
   card.appendChild(body);
   return card;
 }
-function admProvNum(p, key, label, unit) {
+function admProvNum(p, key, label, unit, clampFn) {
   const row = el('div', 'adm-row'); row.appendChild(el('label', null, label));
   const inp = document.createElement('input'); inp.type = 'number'; inp.value = p[key]; inp.step = 'any';
-  inp.onchange = () => { p[key] = parseFloat(inp.value) || 0; saveConfig(); compute(); };
+  inp.onchange = () => { let v = parseFloat(inp.value); if (isNaN(v)) v = 0; if (clampFn) v = clampFn(v, p); p[key] = v; inp.value = v; saveConfig(); compute(); };
   const w = el('div'); w.style.display = 'flex'; w.style.alignItems = 'center'; w.style.gap = '6px';
   w.appendChild(inp); if (unit) w.appendChild(el('span', 'mini-label', unit)); row.appendChild(w);
   return row;
 }
-function admExtraNum(p, label, key) {
+function admExtraNum(p, label, key, clampFn) {
   const row = el('div', 'adm-row'); row.appendChild(el('label', null, label));
   const inp = document.createElement('input'); inp.type = 'number'; inp.value = p.extra[key]; inp.step = 'any';
-  inp.onchange = () => { p.extra[key] = parseFloat(inp.value) || 0; saveConfig(); compute(); };
+  inp.onchange = () => { let v = parseFloat(inp.value); if (isNaN(v)) v = 0; if (clampFn) v = clampFn(v); p.extra[key] = v; inp.value = v; saveConfig(); compute(); };
   row.appendChild(inp);
   return row;
 }
@@ -1290,18 +1291,18 @@ function admGroup(title, hint, rows) {
   rows.forEach((r) => g.appendChild(r));
   return g;
 }
-function admNum(label, key, unit, sub) {
+function admNum(label, key, unit, sub, clampFn) {
   const row = el('div', 'adm-row'); row.appendChild(el('label', null, label + (sub ? `<small>${sub}</small>` : '')));
   const inp = document.createElement('input'); inp.type = 'number'; inp.value = CONFIG[key]; inp.step = 'any';
-  inp.onchange = () => { CONFIG[key] = parseFloat(inp.value) || 0; saveConfig(); compute(); };
+  inp.onchange = () => { let v = parseFloat(inp.value); if (isNaN(v)) v = 0; if (clampFn) v = clampFn(v); CONFIG[key] = v; inp.value = v; saveConfig(); compute(); };
   const w = el('div'); w.style.display = 'flex'; w.style.alignItems = 'center'; w.style.gap = '6px';
   w.appendChild(inp); if (unit) w.appendChild(el('span', 'mini-label', unit)); row.appendChild(w);
   return row;
 }
-function admNumDeep(label, parent, key, sub) {
+function admNumDeep(label, parent, key, sub, clampFn) {
   const row = el('div', 'adm-row'); row.appendChild(el('label', null, label + (sub ? `<small>${sub}</small>` : '')));
   const inp = document.createElement('input'); inp.type = 'number'; inp.value = CONFIG[parent][key]; inp.step = 'any';
-  inp.onchange = () => { CONFIG[parent][key] = parseFloat(inp.value) || 0; saveConfig(); compute(); };
+  inp.onchange = () => { let v = parseFloat(inp.value); if (isNaN(v)) v = 0; if (clampFn) v = clampFn(v); CONFIG[parent][key] = v; inp.value = v; saveConfig(); compute(); };
   row.appendChild(inp);
   return row;
 }
@@ -1328,7 +1329,7 @@ function admCommercialRounding() {
   g.appendChild(el('p', 'hint', "Arrotonda le rate del bonifico a cifre semplici da comunicare. Il totale del bonifico resta invariato: la differenza confluisce nella rata di compensazione."));
   g.appendChild(crSelect('Arrotondamento', 'modo',
     [['Nessuno', 'nessuno'], ["All'euro", 'euro'], ['Ai 5 €', '5'], ['Ai 10 €', '10'], ['Ai 50 €', '50'], ['Personalizzato', 'personalizzato']], true));
-  if (cr.modo === 'personalizzato') g.appendChild(crNum('Multiplo personalizzato', 'personalizzato', '€'));
+  if (cr.modo === 'personalizzato') g.appendChild(crNum('Multiplo personalizzato', 'personalizzato', '€', (v) => Math.max(1, v)));
   g.appendChild(crSelect('Compensazione', 'strategia', [['Ultima rata', 'ultima'], ['Prima rata', 'prima']], false));
   return g;
 }
@@ -1342,10 +1343,10 @@ function crSelect(label, key, opts, refresh) {
   row.appendChild(sel);
   return row;
 }
-function crNum(label, key, unit) {
+function crNum(label, key, unit, clampFn) {
   const row = el('div', 'adm-row'); row.appendChild(el('label', null, label));
   const inp = document.createElement('input'); inp.type = 'number'; inp.value = CONFIG.commercialRounding[key]; inp.step = 'any';
-  inp.onchange = () => { CONFIG.commercialRounding[key] = parseFloat(inp.value) || 0; saveConfig(); compute(); };
+  inp.onchange = () => { let v = parseFloat(inp.value); if (isNaN(v)) v = 0; if (clampFn) v = clampFn(v); CONFIG.commercialRounding[key] = v; inp.value = v; saveConfig(); compute(); };
   const w = el('div'); w.style.display = 'flex'; w.style.alignItems = 'center'; w.style.gap = '6px';
   w.appendChild(inp); if (unit) w.appendChild(el('span', 'mini-label', unit)); row.appendChild(w);
   return row;

@@ -123,6 +123,10 @@ function buildSchedule(alloc, input, cfg) {
     totalM[m] = v;
   }
   const nonZero = totalM.filter((v) => v > 1e-6);
+  // Picco delle RATE MENSILI = massimo dei mesi successivi a oggi (mese 0 escluso).
+  // Il pagamento iniziale (oggi) è un concetto distinto dalla rata mensile: è
+  // vincolato solo dalla disponibilità, mai dal tetto "max rata mensile".
+  const peakMensile = H > 1 ? Math.max(...totalM.slice(1)) : 0;
 
   const incassatoOggi = alloc.A + importoBNPL; // finanziato anticipato (BNPL) + acconto
   const venduto = alloc.A + importoBNPL + B;    // = prezzo (coerenza sulla vendita)
@@ -132,6 +136,7 @@ function buildSchedule(alloc, input, cfg) {
     pagatoOggi: round2(totalM[0]),
     venduto: round2(venduto),
     peak: round2(Math.max(...totalM)),
+    peakMensile: round2(peakMensile),
     nRateEffettive: nonZero.length,
     nRateBonifico: bonificoM.filter((v) => v > 1e-6).length,
     nRateCredito: bonificoM.slice(1).filter((v) => v > 1e-6).length,
@@ -156,7 +161,7 @@ function isHardValid(sol, input, cfg) {
   // Disponibilità oggi = tetto commerciale RIGIDO: il pagamento iniziale non può
   // mai superarla, nemmeno entro tolleranza (regola di business, sempre attiva).
   if (input.dispOggi > 0 && m.pagatoOggi > input.dispOggi + 1e-6) return false;
-  if (input.maxMensile > 0 && m.peak > input.maxMensile * tol + 1e-6) return false;
+  if (input.maxMensile > 0 && m.peakMensile > input.maxMensile * tol + 1e-6) return false;
   // N rate richieste = N pagamenti reali: ogni slot del piano deve avere un
   // importo > 0,50 € (niente rate iniziali/vuote). Regola di business V1.
   for (let i = 0; i < sol.totalM.length; i++) if (sol.totalM[i] <= 0.5) return false;
@@ -178,7 +183,7 @@ function subScores(sol, input, cfg, refs) {
   const minBonifico = input.prezzo > 0 ? clamp(100 * (1 - m.bonificoIniziale / input.prezzo), 0, 100) : 100;
 
   let comfort = 100;
-  if (input.maxMensile > 0) comfort = Math.min(comfort, 100 * (1 - clamp(m.peak / input.maxMensile, 0, 1)));
+  if (input.maxMensile > 0) comfort = Math.min(comfort, 100 * (1 - clamp(m.peakMensile / input.maxMensile, 0, 1)));
   if (input.dispOggi > 0) comfort = Math.min(comfort, 100 * (1 - clamp(m.pagatoOggi / input.dispOggi, 0, 1)));
   comfort = clamp(comfort, 0, 100);
 
@@ -475,6 +480,7 @@ function recomputeSchedule(sol) {
   }
   const nonZero = sol.totalM.filter((v) => v > 1e-6);
   sol.metrics.peak = round2(Math.max(...sol.totalM));
+  sol.metrics.peakMensile = round2(H > 1 ? Math.max(...sol.totalM.slice(1)) : 0);
   sol.metrics.pagatoOggi = round2(sol.totalM[0]);
   sol.metrics.nRateBonifico = sol.bonificoM.filter((v) => v > 1e-6).length;
   sol.metrics.nRateCredito = sol.bonificoM.slice(1).filter((v) => v > 1e-6).length;
@@ -722,11 +728,11 @@ function restoreFocus(f) {
 function getCompatibility(sol) {
   if (!sol) return { level: 'bad', label: 'Non compatibile', reason: '' };
   const inp = state.input, m = sol.metrics;
-  const overMax = inp.maxMensile > 0 && m.peak > inp.maxMensile + 0.5;
+  const overMax = inp.maxMensile > 0 && m.peakMensile > inp.maxMensile + 0.5;
   const overDisp = inp.dispOggi > 0 && m.pagatoOggi > inp.dispOggi + 0.5;
   if (!overMax && !overDisp) return { level: 'ok', label: 'Compatibile', reason: '' };
   const r = [];
-  if (overMax) r.push(`picco rata ${eur(m.peak)} oltre il max ${eur(inp.maxMensile)}`);
+  if (overMax) r.push(`picco rata mensile ${eur(m.peakMensile)} oltre il max ${eur(inp.maxMensile)}`);
   if (overDisp) r.push(`pagato oggi ${eur(m.pagatoOggi)} oltre la disponibilità ${eur(inp.dispOggi)}`);
   return { level: 'warn', label: 'Al limite', reason: r.join(' · ') };
 }
@@ -801,7 +807,7 @@ function explain(sol) {
   else if (p === 'minbonifico') bits.push(m.bonificoIniziale > 0 ? `acconto contenuto a ${eur(m.bonificoIniziale)}` : 'nessun acconto richiesto');
   else if (p === 'vpl') bits.push(`massimo Valore per Lead, con ${liq}% incassato oggi`);
   else bits.push(`equilibrio tra incasso (${liq}%) e sostenibilità della rata`);
-  if (state.input.maxMensile > 0) bits.push(`picco rata ${eur(m.peak)}`);
+  if (state.input.maxMensile > 0) bits.push(`picco rata mensile ${eur(m.peakMensile)}`);
   return 'Ottimizzata per ' + bits.join(' · ') + '.';
 }
 function renderKpis(sol) {

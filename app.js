@@ -532,12 +532,16 @@ const DEFAULT_CONFIG = {
   },
   // VPL = Valore per Lead: formula lineare configurabile (nessuna formula finanziaria)
   vpl: { base: 0, cPrezzo: 0.3, cIncasso: 0.7, cLiquidita: 2, cBNPL: 0.2, cCredito: -0.5 },
+  // Commissione % sul bonifico (acconto + credito). Le commissioni provider sono
+  // nel campo `commissione` di ciascun profilo. SOLO informative: il motore non
+  // le legge mai (nessun impatto su ricerca, scoring, ranking, priorità).
+  commissioneBonifico: 10,
   // Profili Provider: il motore legge SEMPRE queste regole, non conosce i nomi.
   providers: [
     { id: 'scalapay', nome: 'Scalapay', attivo: true, colore: 'scalapay',
-      maxRate: 4, minImporto: 0, maxImporto: 2000, commissione: 0, extra: extraDefault() },
+      maxRate: 4, minImporto: 0, maxImporto: 2000, commissione: 7.5, extra: extraDefault() },
     { id: 'klarna', nome: 'Klarna', attivo: true, colore: 'klarna',
-      maxRate: 3, minImporto: 0, maxImporto: 1500, commissione: 0, extra: extraDefault() },
+      maxRate: 3, minImporto: 0, maxImporto: 1500, commissione: 7.5, extra: extraDefault() },
     { id: 'custom', nome: 'Provider personalizzato', attivo: false, colore: 'custom',
       maxRate: 3, minImporto: 0, maxImporto: 1500, commissione: 0, extra: extraDefault() },
   ],
@@ -766,6 +770,45 @@ function renderResult(sol, mode) {
   if (sol.rounded) root.appendChild(el('div', 'rounded-note', '✓ Importi arrotondati per la trattativa (Smart Rounding)'));
   root.appendChild(el('div', 'section-title', 'Piano mensile'));
   root.appendChild(renderPlan(sol));
+  root.appendChild(renderCommissioni(sol, CONFIG));
+}
+
+// Calcolo commissioni (PURO, informativo): legge la soluzione già calcolata dal
+// motore. Non influenza in alcun modo algoritmo, scoring, ranking o priorità.
+function calcCommissioni(sol, cfg) {
+  const rows = [];
+  const bonifico = round2((sol.metrics.bonificoIniziale || 0) + (sol.metrics.bonificoCredito || 0));
+  const pctB = cfg.commissioneBonifico || 0;
+  if (bonifico > 0.5) rows.push({ nome: 'Bonifico', importo: bonifico, pct: pctB, commissione: round2((bonifico * pctB) / 100) });
+  for (const p of sol.alloc.prov) {
+    if (p.amount <= 0.5) continue; // strumenti non usati: nascosti
+    const pct = (p._profile && p._profile.commissione) || 0;
+    rows.push({ nome: (p._profile && p._profile.nome) || p.id, importo: round2(p.amount), pct, commissione: round2((p.amount * pct) / 100) });
+  }
+  // Il totale è la somma delle singole commissioni già arrotondate: garantisce
+  // che "totale = somma delle righe" sempre.
+  const totale = round2(rows.reduce((s, r) => s + r.commissione, 0));
+  return { rows, totale };
+}
+function fmtPct(p) { return (Math.round(p * 100) / 100).toLocaleString('it-IT') + '%'; }
+
+function renderCommissioni(sol, cfg) {
+  const { rows, totale } = calcCommissioni(sol, cfg);
+  const box = el('div', 'commissioni');
+  box.appendChild(el('div', 'commissioni-title', 'Commissioni previste'));
+  rows.forEach((r) => {
+    const row = el('div', 'commissioni-row');
+    row.appendChild(el('span', 'c-nome', r.nome));
+    row.appendChild(el('span', 'c-imp', `${eur(r.importo)} · ${fmtPct(r.pct)}`));
+    row.appendChild(el('span', 'c-val', eur(r.commissione)));
+    box.appendChild(row);
+  });
+  const tot = el('div', 'commissioni-row commissioni-tot');
+  tot.appendChild(el('span', 'c-nome', 'Totale commissioni'));
+  tot.appendChild(el('span', 'c-imp', ''));
+  tot.appendChild(el('span', 'c-val', eur(totale)));
+  box.appendChild(tot);
+  return box;
 }
 
 function renderVerdict(sol, mode) {
@@ -1080,6 +1123,10 @@ function buildAdmin() {
     admNum('Scostamento max', 'smartRoundingTolleranza', '€', 'oltre questo, mantiene gli importi esatti'),
   ]));
   b.appendChild(admCommercialRounding());
+  b.appendChild(admGroup('Commissioni', 'Percentuali per stimare le commissioni del consulente. Solo informative: non influenzano il motore.', [
+    admNum('Bonifico', 'commissioneBonifico', '%'),
+    ...CONFIG.providers.map((p) => admProvNum(p, 'commissione', p.nome, '%')),
+  ]));
   b.appendChild(admGroup('Motore di calcolo', 'Granularità della ricerca.', [
     admNum('Passo di ricerca', 'searchStep', '€'),
   ]));
@@ -1126,7 +1173,6 @@ function admProvider(p, i) {
   body.appendChild(admProvNum(p, 'maxRate', 'Rate massime', ''));
   body.appendChild(admProvNum(p, 'minImporto', 'Importo minimo', '€'));
   body.appendChild(admProvNum(p, 'maxImporto', 'Importo massimo', '€'));
-  body.appendChild(admProvNum(p, 'commissione', 'Commissione (futuro)', '%'));
 
   // Sotto-sezione: Gestione Extra Prima Rata
   const ex = p.extra;

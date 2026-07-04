@@ -404,14 +404,32 @@ function smartRound(best, input, cfg) {
   if (!cfg.smartRoundingOn) return best;
   const R = cfg.smartRoundingMultiplo;
   const a = best.alloc;
-  let ra = roundTo(a.A, R, input.prezzo);
+  // La disponibilità di oggi è un vincolo commerciale intoccabile: quando c'è,
+  // lo Smart Rounding NON arrotonda l'acconto (né il pagamento iniziale). Arrotonda
+  // solo i totali provider e ri-deriva l'acconto sui provider arrotondati, così il
+  // pagamento di oggi resta ESATTAMENTE = disponibilità concordata.
+  const deriveA = input.dispOggi > 0;
+
   const prov = a.prov.map((p) => ({
     id: p.id, _profile: p._profile, rate: p.rate,
     amount: p.amount > 0 ? roundTo(p.amount, R, p._profile.maxImporto) : 0,
   }));
   prov.forEach((p) => { if (p.amount <= 0) p.rate = 0; });
-  let rb = round2(input.prezzo - ra - prov.reduce((s, p) => s + p.amount, 0));
-  if (rb < 0) { ra = round2(ra + rb); rb = 0; }
+  const sumProv = prov.reduce((s, p) => s + p.amount, 0);
+
+  let ra;
+  if (deriveA) {
+    ra = round2(input.dispOggi - providerFirstSum(prov, input.nRate));
+    if (ra < -1e-6) return best; // i provider arrotondati sforerebbero la disponibilità
+    ra = Math.max(0, ra);
+  } else {
+    ra = roundTo(a.A, R, input.prezzo); // nessuna disponibilità: acconto libero (invariato)
+  }
+  let rb = round2(input.prezzo - ra - sumProv);
+  if (rb < 0) {
+    if (deriveA) return best;      // acconto pinnato alla disponibilità: torno all'esatto
+    ra = round2(ra + rb); rb = 0;  // senza disponibilità: comportamento invariato
+  }
   if (ra < 0) return best;
 
   const sol = buildSchedule({ A: ra, B: rb, prov }, input, cfg);
@@ -423,6 +441,14 @@ function smartRound(best, input, cfg) {
   sol.score = best.score; sol.sub = best.sub; sol.candidateCount = best.candidateCount;
   sol.rounded = true;
   return sol;
+}
+// Somma delle prime rate (mese 0) dei provider usati — indipendente dall'acconto.
+function providerFirstSum(prov, nRate) {
+  let Hc = nRate;
+  for (const p of prov) if (p.amount > 0) Hc = Math.max(Hc, p.rate);
+  let s = 0;
+  for (const p of prov) if (p.amount > 0) s += buildProviderMonthly(p.amount, p.rate, Hc, p._profile).arr[0];
+  return s;
 }
 
 /* ---- Commercial Rounding (rate del bonifico) -------------------------------
